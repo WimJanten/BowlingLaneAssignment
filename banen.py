@@ -8,8 +8,7 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # =============================================================================
 input_file = 'Geboekte producten.xlsx'          # Your reservation Excel file
-output_file_full = 'assigned_lanes_full.xlsx'   # Full schedule
-output_file_compact = 'assigned_lanes_compact.xlsx'  # Compact schedule
+output_file_full = 'BanenPlanning.xlsx'   # Full schedule
 
 
 # =============================================================================
@@ -40,7 +39,7 @@ lanes = {i: [] for i in range(1, 9)}  # lanes 1 to 8
 assignments = []
 
 # Sort by group and start time
-df = df.sort_values(by=['Groep', 'Begindatum'])
+df = df.sort_values(by=['Begindatum', 'Groep'])  # Sort by time first, then group
 
 
 def is_lane_free(lane, new_start, new_end):
@@ -48,6 +47,7 @@ def is_lane_free(lane, new_start, new_end):
     Helper function to check if a lane is free during the specified time period.
     """
     for booked_start, booked_end in lanes[lane]:
+        # Check for overlap: new booking overlaps if it starts before existing ends AND ends after existing starts
         if new_start < booked_end and new_end > booked_start:
             return False
     return True
@@ -61,69 +61,133 @@ def is_lane_free(lane, new_start, new_end):
 facing_pairs = [(1, 2), (3, 4), (5, 6), (7, 8)]
 previous_assignment = {}
 
-# Process each reservation
-for idx, row in df.iterrows():
-    start_time = pd.to_datetime(row['Begindatum'])
-    groep = row['Groep']
-    lanes_needed = row['lanes_needed']
-    end_time = start_time + timedelta(minutes=55)
+# Group bookings by time slot for better processing
+df_grouped = df.groupby('Begindatum')
 
-    # Determine possible lanes based on start time
-    if start_time.minute == 0:
-        possible_lanes = range(1, 5)  # lanes 1-4
-        possible_pairs = [(1, 2), (3, 4)]
-    elif start_time.minute == 30:
-        possible_lanes = range(5, 9)  # lanes 5-8
-        possible_pairs = [(5, 6), (7, 8)]
-    else:
-        print(f"Skipping {groep} at {start_time} — invalid start time (must be :00 or :30).")
-        continue
-
-    assigned_lanes = []
-
-    # Try to continue previous lane assignment if group matches and times are consecutive
-    if groep in previous_assignment:
-        last_end_time, last_lanes = previous_assignment[groep]
-        if abs((start_time - last_end_time).total_seconds()) <= 5 * 60:
-            if all(is_lane_free(lane, start_time, end_time) for lane in last_lanes) and len(last_lanes) == lanes_needed:
-                assigned_lanes = last_lanes
-
-    # Otherwise, assign new lanes
-    if not assigned_lanes:
-        # First, try full facing pairs
-        for pair in possible_pairs:
-            if all(is_lane_free(lane, start_time, end_time) for lane in pair):
-                if lanes_needed == 2:
-                    assigned_lanes = list(pair)
-                    break
-                elif lanes_needed > 2:
-                    assigned_lanes.extend(list(pair))
+# Process each time slot
+for time_slot, time_group in df_grouped:
+    start_time = pd.to_datetime(time_slot)
+    print(f"\n⏰ Processing time slot: {start_time}")
+    
+    # Separate consecutive bookings from new bookings
+    consecutive_bookings = []
+    new_bookings = []
+    
+    for idx, row in time_group.iterrows():
+        groep = row['Groep']
+        lanes_needed = row['lanes_needed']
+        previous_hour = start_time - timedelta(hours=1)
         
-        # If still need more lanes (e.g. lanes_needed > 2)
-        if len(assigned_lanes) < lanes_needed:
-            for lane in possible_lanes:
-                if lane not in assigned_lanes and is_lane_free(lane, start_time, end_time):
-                    assigned_lanes.append(lane)
-                if len(assigned_lanes) == lanes_needed:
+        # Check if this is a consecutive booking
+        is_consecutive = False
+        for assignment in assignments:
+            if (assignment['Groep'] == groep and 
+                assignment['Starttijd'] == previous_hour):
+                is_consecutive = True
+                break
+        
+        booking_info = {
+            'idx': idx,
+            'groep': groep,
+            'lanes_needed': lanes_needed,
+            'start_time': start_time,
+            'end_time': start_time + timedelta(minutes=55)
+        }
+        
+        if is_consecutive:
+            consecutive_bookings.append(booking_info)
+        else:
+            new_bookings.append(booking_info)
+    
+    print(f"  📅 Consecutive bookings: {[b['groep'] for b in consecutive_bookings]}")
+    print(f"  🆕 New bookings: {[b['groep'] for b in new_bookings]}")
+    
+    # Process consecutive bookings FIRST
+    all_bookings = consecutive_bookings + new_bookings
+    
+    for booking in all_bookings:
+        groep = booking['groep']
+        lanes_needed = booking['lanes_needed']
+        start_time = booking['start_time']
+        end_time = booking['end_time']
+        
+        # Determine possible lanes based on start time
+        if start_time.minute == 0:
+            possible_lanes = range(1, 5)  # lanes 1-4
+            possible_pairs = [(1, 2), (3, 4)]
+        elif start_time.minute == 30:
+            possible_lanes = range(5, 9)  # lanes 5-8
+            possible_pairs = [(5, 6), (7, 8)]
+        else:
+            print(f"Skipping {groep} at {start_time} — invalid start time (must be :00 or :30).")
+            continue
+
+        assigned_lanes = []
+
+        # Check if this is a consecutive booking
+        if booking in consecutive_bookings:
+            # PRIORITY 1: Handle consecutive booking
+            previous_hour = start_time - timedelta(hours=1)
+            
+            # Find the previous assignment
+            for assignment in assignments:
+                if (assignment['Groep'] == groep and 
+                    assignment['Starttijd'] == previous_hour):
+                    previous_lanes = assignment['Lanes']
+                    
+                    if len(previous_lanes) == lanes_needed:
+                        # Check if the same lanes are available
+                        all_lanes_free = True
+                        for lane in previous_lanes:
+                            if not is_lane_free(lane, start_time, end_time):
+                                all_lanes_free = False
+                                break
+                        
+                        if all_lanes_free:
+                            assigned_lanes = previous_lanes
+                            print(f"✅ Continuing {groep} on same lanes {assigned_lanes} from previous hour")
+                        else:
+                            print(f"⚠️ Cannot continue {groep} on same lanes - some lanes not available")
+                    else:
+                        print(f"⚠️ Cannot continue {groep} - different number of lanes needed")
                     break
 
-    # Check if enough lanes were assigned
-    if len(assigned_lanes) < lanes_needed:
-        print(f"⚠️ Not enough lanes available for {groep} at {start_time}. Only {len(assigned_lanes)} assigned.")
-        continue
+        # PRIORITY 2: If no lanes assigned yet, use normal assignment logic
+        if not assigned_lanes:
+            # First, try full facing pairs
+            for pair in possible_pairs:
+                if all(is_lane_free(lane, start_time, end_time) for lane in pair):
+                    if lanes_needed == 2:
+                        assigned_lanes = list(pair)
+                        break
+                    elif lanes_needed > 2:
+                        assigned_lanes.extend(list(pair))
+            
+            # If still need more lanes (e.g. lanes_needed > 2)
+            if len(assigned_lanes) < lanes_needed:
+                for lane in possible_lanes:
+                    if lane not in assigned_lanes and is_lane_free(lane, start_time, end_time):
+                        assigned_lanes.append(lane)
+                    if len(assigned_lanes) == lanes_needed:
+                        break
 
-    # Book the lanes
-    for lane in assigned_lanes:
-        lanes[lane].append((start_time, end_time))
+        # Check if enough lanes were assigned
+        if len(assigned_lanes) < lanes_needed:
+            print(f"⚠️ Not enough lanes available for {groep} at {start_time}. Only {len(assigned_lanes)} assigned.")
+            continue
 
-    assignments.append({
-        'Groep': groep,
-        'Starttijd': start_time,
-        'Eindtijd': end_time,
-        'Lanes': assigned_lanes
-    })
+        # Book the lanes
+        for lane in assigned_lanes:
+            lanes[lane].append((start_time, end_time))
 
-    previous_assignment[groep] = (end_time, assigned_lanes)
+        assignments.append({
+            'Groep': groep,
+            'Starttijd': start_time,
+            'Eindtijd': end_time,
+            'Lanes': assigned_lanes
+        })
+
+        previous_assignment[groep] = (end_time, assigned_lanes)
 
 
 # =============================================================================
@@ -253,26 +317,3 @@ format_worksheet(ws_full, schedule, "Full Schedule")
 wb_full.save(output_file_full)
 print(f"✅ Full schedule saved to {output_file_full}")
 
-
-# =============================================================================
-# STEP 6: SAVE COMPACT VERSION (ONLY BOOKED TIMES)
-# =============================================================================
-
-wb_compact = Workbook()
-ws_compact = wb_compact.active
-ws_compact.title = "Bowling Schedule Compact"
-
-# Write headers
-ws_compact.append(headers)
-
-for time_str in sorted_times:
-    lanes_dict = schedule[time_str]
-    if any(lanes_dict[lane] != "" for lane in range(1, 9)):  # Only times with at least 1 reservation
-        row = [time_str] + [lanes_dict[lane] for lane in range(1, 9)]
-        ws_compact.append(row)
-
-# Apply formatting
-format_worksheet(ws_compact, schedule, "Compact Schedule")
-
-wb_compact.save(output_file_compact)
-print(f"✅ Compact schedule saved to {output_file_compact}")
